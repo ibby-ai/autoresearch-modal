@@ -2,7 +2,7 @@
 
 ---
 
-This is an adaptation of [karpathy/autoresearch](https://github.com/karpathy/autoresearch) and adds a [Modal](https://modal.com), enabling autonomous training experiments on cloud NVIDIA GPUs.
+This is an adaptation of [karpathy/autoresearch](https://github.com/karpathy/autoresearch) with a [Modal](https://modal.com) runtime for running autonomous training runs on NVIDIA GPUs.
 
 ---
 
