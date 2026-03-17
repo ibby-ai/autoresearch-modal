@@ -1,5 +1,6 @@
 """Tests for pure autoresearch helpers."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -8,11 +9,14 @@ from agent_sandbox.autoresearch import (
     RESULTS_HEADER,
     append_result_row,
     branch_name,
+    build_autoresearch_agent_prompt,
     build_claude_baseline_prompt,
     build_paths,
     ensure_results_file,
+    generate_run_tag,
     is_data_ready,
     parse_training_summary,
+    resolve_run_tag,
     validate_run_tag,
 )
 
@@ -21,10 +25,33 @@ def test_validate_run_tag_accepts_simple_value():
     assert validate_run_tag("mar16-smoke") == "mar16-smoke"
 
 
+def test_generate_run_tag_is_sortable_and_valid():
+    tag = generate_run_tag(
+        "agent-loop",
+        now=datetime(2026, 3, 17, 15, 42, 33, tzinfo=UTC),
+        entropy="a7c3f1",
+    )
+
+    assert tag == "20260317-154233-agentloop-a7c3f1"
+    assert validate_run_tag(tag) == tag
+
+
 @pytest.mark.parametrize("value", ["", "bad/tag", "bad tag", "../oops"])
 def test_validate_run_tag_rejects_invalid_values(value: str):
     with pytest.raises(ValueError):
         validate_run_tag(value)
+
+
+def test_resolve_run_tag_preserves_explicit_override():
+    assert resolve_run_tag("  mar16-explicit  ", purpose="baseline") == "mar16-explicit"
+
+
+def test_resolve_run_tag_generates_when_missing():
+    tag = resolve_run_tag(None, purpose="prepare")
+
+    assert tag
+    assert "-prepare-" in tag
+    assert validate_run_tag(tag) == tag
 
 
 def test_branch_name_prefixes_run_tag():
@@ -35,7 +62,11 @@ def test_build_paths_uses_run_tag_layout():
     paths = build_paths("/workspace/autoresearch", "/cache/autoresearch", "smoke")
     assert paths.run_root == Path("/workspace/autoresearch/smoke")
     assert paths.repo_dir == Path("/workspace/autoresearch/smoke/repo")
+    assert paths.program_path == Path("/workspace/autoresearch/smoke/repo/program.md")
     assert paths.results_path == Path("/workspace/autoresearch/smoke/repo/results.tsv")
+    assert paths.prepare_log_path == Path("/workspace/autoresearch/smoke/prepare.log")
+    assert paths.agent_log_path == Path("/workspace/autoresearch/smoke/agent.log")
+    assert paths.state_path == Path("/workspace/autoresearch/smoke/modal-run-state.json")
 
 
 def test_ensure_results_file_writes_header_once(tmp_path: Path):
@@ -109,3 +140,15 @@ def test_build_claude_baseline_prompt_is_bounded():
     assert "autoresearch/mar16" in prompt
     assert "Do exactly one baseline training run" in prompt
     assert "Do not modify `train.py`" in prompt
+    assert "uv run train.py > run.log 2>&1" in prompt
+
+
+def test_build_autoresearch_agent_prompt_matches_upstream_loop():
+    prompt = build_autoresearch_agent_prompt("mar16", 10, 12)
+
+    assert "autoresearch/mar16" in prompt
+    assert "Treat `README.md` and `program.md` as the primary contract" in prompt
+    assert "Modify only `train.py`." in prompt
+    assert "uv run train.py > run.log 2>&1" in prompt
+    assert "Perform up to 12 completed experiment attempts" in prompt
+    assert "Do not ask the human for confirmation once the loop begins." in prompt
