@@ -1,25 +1,25 @@
 """Shared helpers for the autoresearch Modal wrapper."""
 
 from agent_sandbox.utils.cli import (
-    CLAUDE_CLI_APP_ROOT,
-    CLAUDE_CLI_HOME,
-    CLAUDE_CLI_PATH,
-    CLAUDE_CLI_USER,
-    claude_cli_env,
-    claude_cli_ids,
-    demote_to_claude,
-    maybe_chown_for_claude,
+    RUNTIME_APP_ROOT,
+    RUNTIME_CLI_PATH,
+    RUNTIME_HOME,
+    RUNTIME_USER,
+    demote_to_runtime_user,
+    maybe_chown_for_runtime_user,
     require_claude_cli_auth,
+    runtime_user_env,
+    runtime_user_ids,
 )
 
 __all__ = [
-    "CLAUDE_CLI_USER",
-    "CLAUDE_CLI_HOME",
-    "CLAUDE_CLI_PATH",
-    "CLAUDE_CLI_APP_ROOT",
-    "claude_cli_env",
-    "claude_cli_ids",
-    "demote_to_claude",
-    "maybe_chown_for_claude",
+    "RUNTIME_USER",
+    "RUNTIME_HOME",
+    "RUNTIME_CLI_PATH",
+    "RUNTIME_APP_ROOT",
+    "runtime_user_env",
+    "runtime_user_ids",
+    "demote_to_runtime_user",
+    "maybe_chown_for_runtime_user",
     "require_claude_cli_auth",
 ]

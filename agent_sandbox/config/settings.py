@@ -22,28 +22,24 @@ class Settings(BaseSettings):
         default="anthropic-secret",
         description="Modal secret that provides ANTHROPIC_API_KEY for Claude CLI runs.",
     )
-    autoresearch_repo_url: str = Field(
-        default="https://github.com/karpathy/autoresearch.git",
-        description="Upstream autoresearch repository cloned into the persistent workspace volume.",
-    )
     autoresearch_base_branch: str = Field(
         default="master",
-        description="Upstream branch used when creating a new autoresearch/<run_tag> branch.",
+        description="Git branch used when seeding a new autoresearch/<run_tag> branch in the workspace.",
     )
     autoresearch_workspace_vol_name: str = Field(
         default="autoresearch-workspace",
-        description="Modal Volume name for persistent upstream checkouts.",
+        description="Modal Volume name for persistent per-run workspace repos.",
     )
     autoresearch_cache_vol_name: str = Field(
         default="autoresearch-cache",
         description="Modal Volume name for ~/.cache/autoresearch and compiler caches.",
     )
     autoresearch_workspace_root: str = Field(
-        default="/home/claude/workspaces/autoresearch",
-        description="Mount path for the persistent upstream workspace volume.",
+        default="/home/agent/workspaces/autoresearch",
+        description="Mount path for the persistent per-run workspace volume.",
     )
     autoresearch_cache_root: str = Field(
-        default="/home/claude/.cache/autoresearch",
+        default="/home/agent/.cache/autoresearch",
         description="Mount path for the upstream cache volume.",
     )
     autoresearch_prepare_num_shards: int = Field(
@@ -52,7 +48,7 @@ class Settings(BaseSettings):
     )
     autoresearch_gpu: str = Field(
         default="H100",
-        description="GPU type requested for baseline and Claude-driven runs.",
+        description="GPU type requested for direct baseline smokes and Claude-driven agent runs.",
     )
     autoresearch_prepare_timeout: int = Field(
         default=60 * 60,
@@ -64,15 +60,15 @@ class Settings(BaseSettings):
     )
     autoresearch_claude_timeout: int = Field(
         default=60 * 60 * 8,
-        description="Timeout in seconds for one bounded Claude session.",
+        description="Timeout in seconds for one Claude-driven autoresearch session.",
     )
     autoresearch_git_user_name: str = Field(
         default="Autoresearch Modal",
-        description="Git user.name configured inside the upstream checkout.",
+        description="Git user.name configured inside the per-run workspace repo.",
     )
     autoresearch_git_user_email: str = Field(
         default="autoresearch@modal.local",
-        description="Git user.email configured inside the upstream checkout.",
+        description="Git user.email configured inside the per-run workspace repo.",
     )
 
 

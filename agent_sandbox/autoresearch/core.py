@@ -1,14 +1,30 @@
-"""Pure helpers for the Modal autoresearch runner."""
+"""Helpers for the Modal autoresearch runner."""
 
 from __future__ import annotations
 
 import re
+import shutil
 import textwrap
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from secrets import token_hex
 
 RESULTS_HEADER = "commit\tval_bpb\tmemory_gb\tstatus\tdescription\n"
 RUN_TAG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+VENDORED_PROJECT_ROOT_ENTRIES = (
+    ".gitignore",
+    ".python-version",
+    "README.md",
+    "analysis.ipynb",
+    "prepare.py",
+    "program.md",
+    "progress.png",
+    "pyproject.toml",
+    "train.py",
+    "uv.lock",
+)
+SEEDED_REPO_RUNTIME_ARTIFACTS = ("results.tsv",)
 
 
 @dataclass(frozen=True)
@@ -19,8 +35,12 @@ class AutoresearchPaths:
     cache_dir: Path
     run_root: Path
     repo_dir: Path
+    program_path: Path
     results_path: Path
     run_log_path: Path
+    prepare_log_path: Path
+    agent_log_path: Path
+    state_path: Path
 
 
 @dataclass(frozen=True)
@@ -38,6 +58,22 @@ class TrainingSummary:
     depth: int
 
 
+def copy_vendored_project_root(source_root: Path, destination_root: Path) -> None:
+    """Copy only the vendored upstream root entries into a seeded workspace repo."""
+    if destination_root.exists():
+        raise FileExistsError(f"Destination already exists: {destination_root}")
+    destination_root.mkdir(parents=True)
+    for entry_name in VENDORED_PROJECT_ROOT_ENTRIES:
+        source_path = source_root / entry_name
+        if not source_path.exists():
+            raise FileNotFoundError(f"Missing vendored root entry: {source_path}")
+        destination_path = destination_root / entry_name
+        if source_path.is_dir():
+            shutil.copytree(source_path, destination_path)
+        else:
+            shutil.copy2(source_path, destination_path)
+
+
 def validate_run_tag(run_tag: str) -> str:
     """Validate a user-provided run tag."""
     value = run_tag.strip()
@@ -48,6 +84,28 @@ def validate_run_tag(run_tag: str) -> str:
     if not RUN_TAG_PATTERN.fullmatch(value):
         raise ValueError("run_tag may only contain letters, numbers, dot, underscore, and dash")
     return value
+
+
+def generate_run_tag(
+    purpose: str,
+    *,
+    now: datetime | None = None,
+    entropy: str | None = None,
+) -> str:
+    """Generate a sortable run tag that still satisfies the validation contract."""
+    label = re.sub(r"[^A-Za-z0-9]+", "", purpose.lower())
+    if not label:
+        raise ValueError("purpose must include at least one letter or number")
+    timestamp = (now or datetime.now(UTC)).astimezone(UTC).strftime("%Y%m%d-%H%M%S")
+    suffix = entropy if entropy is not None else token_hex(3)
+    return validate_run_tag(f"{timestamp}-{label}-{suffix}")
+
+
+def resolve_run_tag(run_tag: str | None, *, purpose: str) -> str:
+    """Validate an explicit run tag or generate one when the caller omits it."""
+    if run_tag is None:
+        return generate_run_tag(purpose)
+    return validate_run_tag(run_tag)
 
 
 def branch_name(run_tag: str) -> str:
@@ -68,8 +126,12 @@ def build_paths(
         cache_dir=Path(cache_root),
         run_root=run_root,
         repo_dir=repo_dir,
+        program_path=repo_dir / "program.md",
         results_path=repo_dir / "results.tsv",
         run_log_path=repo_dir / "run.log",
+        prepare_log_path=run_root / "prepare.log",
+        agent_log_path=run_root / "agent.log",
+        state_path=run_root / "modal-run-state.json",
     )
 
 
@@ -146,22 +208,82 @@ def build_claude_baseline_prompt(run_tag: str, prepare_num_shards: int) -> str:
     branch = branch_name(run_tag)
     return textwrap.dedent(
         f"""
-        You are operating inside a cloned checkout of karpathy/autoresearch.
+        You are operating inside a workspace seeded from the vendored karpathy/autoresearch project.
 
         Follow the repository's `program.md` setup contract, but this session is intentionally bounded:
 
         1. Verify the current branch is `{branch}`. If it does not exist yet, create it from the current `master`.
         2. Read `README.md`, `program.md`, `prepare.py`, and `train.py` before taking action.
-        3. If `~/.cache/autoresearch` is not ready, run `python prepare.py --num-shards {prepare_num_shards}`.
-        4. Ensure `results.tsv` exists with the exact upstream header row.
-        5. Do exactly one baseline training run with the code as-is:
-           `python train.py > run.log 2>&1`
-        6. Inspect the summary with:
+        3. If `.venv` is missing, run `uv sync`.
+        4. If `~/.cache/autoresearch` is not ready, run `uv run prepare.py --num-shards {prepare_num_shards}`.
+        5. Ensure `results.tsv` exists with the exact upstream header row.
+        6. Do exactly one baseline training run with the code as-is:
+           `uv run train.py > run.log 2>&1`
+        7. Inspect the summary with:
            `grep "^val_bpb:\\|^peak_vram_mb:" run.log`
-        7. Record the baseline in `results.tsv` as a `keep` row with description `baseline`.
-        8. Do not modify `train.py`, do not start a second experiment, and do not ask for confirmation.
-        9. Finish by printing a short summary that includes the branch name, current commit, and baseline `val_bpb`.
+        8. Record the baseline in `results.tsv` as a `keep` row with description `baseline`.
+        9. Do not modify `train.py`, do not start a second experiment, and do not ask for confirmation.
+        10. Finish by printing a short summary that includes the branch name, current commit, and baseline `val_bpb`.
 
         Use git CLI commands directly for branch/status/commit inspection. Keep all output concise.
+        """
+    ).strip()
+
+
+def build_autoresearch_agent_prompt(
+    run_tag: str,
+    prepare_num_shards: int,
+    max_experiments: int,
+) -> str:
+    """Build the primary Claude prompt for the upstream-style research loop."""
+    branch = branch_name(run_tag)
+    return textwrap.dedent(
+        f"""
+        You are operating inside a Modal workspace seeded from the vendored karpathy/autoresearch project.
+
+        Treat `README.md` and `program.md` as the primary contract. The human controls `program.md`;
+        you are the autonomous researcher who edits only `train.py`.
+
+        Session setup:
+
+        1. Verify the current branch is `{branch}`. If it does not exist yet, create it from the current `master`.
+        2. Read `README.md`, `program.md`, `prepare.py`, and `train.py` before acting.
+        3. If `.venv` is missing, run `uv sync`.
+        4. If `~/.cache/autoresearch` is not ready, run `uv run prepare.py --num-shards {prepare_num_shards}`.
+        5. Ensure `results.tsv` exists with the exact upstream header row.
+        6. If `results.tsv` only has the header row or no baseline entry yet, establish the baseline first:
+           `uv run train.py > run.log 2>&1`
+           then inspect `run.log`, record the row as `keep` with description `baseline`, and continue.
+
+        Autonomous experiment loop:
+
+        - Perform up to {max_experiments} completed experiment attempts after the baseline in this session.
+        - Do not ask the human for confirmation once the loop begins.
+        - Modify only `train.py`. Do not modify `prepare.py`, `program.md`, `pyproject.toml`, or the evaluation harness.
+        - Use git CLI directly. Keep `results.tsv`, `run.log`, and any local scratch logs uncommitted.
+        - For each experiment:
+          1. Inspect git state and note the starting commit.
+          2. Edit `train.py` with one concrete idea.
+          3. Commit the `train.py` change.
+          4. Run `uv run train.py > run.log 2>&1`.
+          5. Read `grep "^val_bpb:\\|^peak_vram_mb:" run.log`.
+          6. If the run crashed, inspect `tail -n 50 run.log`, decide whether to retry a small obvious fix or log a `crash` row and move on.
+          7. Append the outcome to `results.tsv` using the upstream tab-separated format.
+          8. If the result improved, keep the commit and continue from it.
+          9. If the result is equal or worse, reset the branch back to the starting commit for that experiment and continue.
+
+        Research goals:
+
+        - Optimize for lower `val_bpb`.
+        - Respect the fixed runtime budget encoded by upstream.
+        - Prefer simpler wins over hacky complexity when the metric change is marginal.
+        - Keep VRAM increases reasonable unless the gain is clearly worthwhile.
+
+        Finish by printing a short summary with:
+
+        - experiments attempted in this session
+        - best `val_bpb` observed in this session
+        - current branch and commit
+        - any unresolved crash or limitation
         """
     ).strip()
