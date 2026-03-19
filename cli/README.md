@@ -26,6 +26,8 @@ uv run autoresearch-modal --help
 - `tail`
 - `claude-baseline`
 
+`program get`, `inspect`, and `tail` are read-only follow-up commands over existing run tags. They should fail on an unknown tag instead of bootstrapping a new workspace.
+
 ## Dry Run
 
 Append `--dry-run` before or after a subcommand to preview the resolved Modal target, exact subprocess argv, scalar kwargs, and compact file metadata without calling Modal.
@@ -36,3 +38,5 @@ uv run autoresearch-modal program set --dry-run --run-tag smoke --file ./program
 ```
 
 Dry run resolves local file-backed inputs first, but it shows metadata (`path`, `bytes`, `line_count`, `sha256_12`) instead of dumping file contents.
+
+For `run` and `claude-baseline`, a live failure with an explicit `--run-tag` now triggers a best-effort follow-up `inspect` so the CLI error includes current run-state and recent artifact tails when available.

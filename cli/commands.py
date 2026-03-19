@@ -21,12 +21,20 @@ import hashlib
 import json
 import subprocess
 import sys
+import tempfile
 from argparse import Namespace
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agent_sandbox.config.settings import get_settings
+
 MODAL_MODULE = "agent_sandbox.autoresearch_app"
+FAILURE_CONTEXT_COMMANDS = {"run", "claude-baseline"}
+FAILURE_CONTEXT_LINES = 20
+RECONCILE_CONTEXT_COMMANDS = {"inspect", "tail"}
+AUTORESEARCH_WORKSPACE_SEED_SOURCE = "vendored-project-root-allowlist"
+_settings = get_settings()
 
 
 class CliExecutionError(RuntimeError):
@@ -108,6 +116,10 @@ class CommandPlan:
         CLI. This method preserves that contract and translates subprocess
         failures into :class:`CliExecutionError`.
         """
+        if self.command in RECONCILE_CONTEXT_COMMANDS:
+            host_payload = _resolve_host_follow_up_payload(self.command, self.kwargs)
+            if host_payload is not None:
+                return host_payload
         completed = subprocess.run(
             self.argv(),
             capture_output=True,
@@ -115,8 +127,13 @@ class CommandPlan:
             check=False,
         )
         if completed.returncode != 0:
-            raise CliExecutionError(_format_subprocess_error(self.command, completed))
-        return _parse_json_output(completed.stdout)
+            message = _format_subprocess_error(self.command, completed)
+            context = _best_effort_failure_context(self.command, self.kwargs.get("run_tag"))
+            if context is not None:
+                message += "\nRun context:\n" + json.dumps(context, indent=2, sort_keys=True)
+            raise CliExecutionError(message)
+        payload = _parse_json_output(completed.stdout)
+        return _maybe_reconcile_payload(self.command, payload, self.kwargs)
 
     def dry_run_payload(self) -> dict[str, Any]:
         """Render the resolved action without invoking Modal.
@@ -198,6 +215,536 @@ def _parse_json_output(output: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise CliExecutionError("Modal command returned JSON that was not an object.")
     return parsed
+
+
+def _modal_volume_remote_path(run_tag: str, suffix: str) -> str:
+    return f"/{run_tag}/{suffix}"
+
+
+def _absolute_workspace_path(run_tag: str, suffix: str) -> str:
+    return str(Path(_settings.autoresearch_workspace_root) / run_tag / suffix)
+
+
+def _host_artifact_paths(path_value: Any, *, run_tag: str, suffix: str) -> tuple[str, str]:
+    display_path = (
+        str(path_value)
+        if isinstance(path_value, str) and path_value
+        else _absolute_workspace_path(run_tag, suffix)
+    )
+    return display_path, _modal_volume_remote_path(run_tag, suffix)
+
+
+def _read_volume_file_text(remote_path: str) -> str | None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_destination = Path(tmpdir) / Path(remote_path).name
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "modal",
+                "volume",
+                "get",
+                _settings.autoresearch_workspace_vol_name,
+                remote_path,
+                str(local_destination),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0 or not local_destination.exists():
+            return None
+        return local_destination.read_text(encoding="utf-8", errors="ignore")
+
+
+def _read_volume_file_lines(remote_path: str, *, lines: int) -> list[str]:
+    content = _read_volume_file_text(remote_path)
+    if content is None:
+        return []
+    return content.splitlines()[-lines:]
+
+
+def _read_host_run_state(run_tag: str) -> dict[str, Any] | None:
+    content = _read_volume_file_text(_modal_volume_remote_path(run_tag, "modal-run-state.json"))
+    if content is None:
+        return None
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _git_status(repo_dir: Path) -> tuple[list[dict[str, str]], list[str]]:
+    completed = subprocess.run(
+        ["git", "status", "--porcelain=v1"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return [], []
+    tracked_changes: list[dict[str, str]] = []
+    untracked_files: list[str] = []
+    for line in completed.stdout.splitlines():
+        if len(line) < 3:
+            continue
+        status = line[:2]
+        path = line[3:] if len(line) > 3 and line[2] == " " else line[2:]
+        if status == "??":
+            untracked_files.append(path)
+            continue
+        tracked_changes.append({"status": status.strip(), "path": path})
+    return tracked_changes, untracked_files
+
+
+def _current_commit(repo_dir: Path) -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return (completed.stdout or "").strip()
+
+
+def _read_host_repo_snapshot(run_tag: str) -> dict[str, Any] | None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_destination = Path(tmpdir) / "repo"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "modal",
+                "volume",
+                "get",
+                _settings.autoresearch_workspace_vol_name,
+                _modal_volume_remote_path(run_tag, "repo"),
+                str(local_destination),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0 or not local_destination.exists():
+            return None
+        tracked_changes, untracked_files = _git_status(local_destination)
+        allowed_dirty_paths = {
+            "program.md",
+            "results.tsv",
+            "run.log",
+        }
+        unexpected_dirty_paths = sorted(
+            {entry["path"] for entry in tracked_changes if entry["path"] not in allowed_dirty_paths}
+            | {path for path in untracked_files if path not in allowed_dirty_paths}
+        )
+        return {
+            "repo_dir": str(local_destination),
+            "repo_root_files": sorted(
+                path.name for path in local_destination.iterdir() if path.name != ".git"
+            ),
+            "current_commit": _current_commit(local_destination),
+            "tracked_changes": tracked_changes,
+            "untracked_files": untracked_files,
+            "unexpected_dirty_paths": unexpected_dirty_paths,
+        }
+
+
+def _host_terminal_run_state(run_tag: str) -> dict[str, Any] | None:
+    state = _read_host_run_state(run_tag)
+    if state is None:
+        return None
+    if state.get("status") != "running":
+        return state
+
+    app_id = state.get("modal_app_id")
+    app_record = _lookup_modal_app_record(app_id) if isinstance(app_id, str) and app_id else None
+    if app_record is None:
+        reconciled_state = _reconcile_run_state(
+            run_tag,
+            state_status="stale",
+            terminal_reason="modal_app_not_found",
+        )
+        post_reconcile_state = _read_host_run_state(run_tag)
+        if isinstance(post_reconcile_state, dict) and post_reconcile_state.get("status") != "running":
+            return post_reconcile_state
+        return reconciled_state or {
+            **state,
+            "status": "stale",
+            "terminal_reason": "modal_app_not_found",
+        }
+    if app_record["running_tasks"] > 0:
+        enriched_state = {
+            **state,
+            "modal_app_running_tasks": app_record["running_tasks"],
+        }
+        if app_record["state"]:
+            enriched_state["modal_app_state"] = app_record["state"]
+        return enriched_state
+
+    reconciled_state = _reconcile_run_state(
+        run_tag,
+        state_status="interrupted",
+        terminal_reason="modal_app_stopped",
+        modal_app_state=str(app_record["state"] or ""),
+        modal_app_running_tasks=int(app_record["running_tasks"]),
+    )
+    post_reconcile_state = _read_host_run_state(run_tag)
+    if isinstance(post_reconcile_state, dict) and post_reconcile_state.get("status") != "running":
+        return post_reconcile_state
+    return reconciled_state or {
+        **state,
+        "status": "interrupted",
+        "terminal_reason": "modal_app_stopped",
+        "modal_app_running_tasks": app_record["running_tasks"],
+        "modal_app_state": app_record["state"],
+    }
+
+
+def _host_follow_up_context(run_tag: str, *, lines: int) -> dict[str, Any] | None:
+    run_state = _host_terminal_run_state(run_tag)
+    if run_state is None or run_state.get("status") == "running":
+        return None
+    context: dict[str, Any] = {"run_state": run_state}
+    for key, suffix in (
+        ("agent_log_tail", "agent.log"),
+        ("run_log_tail", "repo/run.log"),
+        ("prepare_log_tail", "prepare.log"),
+        ("results_tail", "repo/results.tsv"),
+    ):
+        value = _read_volume_file_lines(_modal_volume_remote_path(run_tag, suffix), lines=lines)
+        if value:
+            context[key] = value
+    return context
+
+
+def _host_follow_up_inspect_payload(run_tag: str, *, lines: int) -> dict[str, Any] | None:
+    run_state = _host_terminal_run_state(run_tag)
+    if run_state is None or run_state.get("status") == "running":
+        return None
+    repo_snapshot = _read_host_repo_snapshot(run_tag) or {}
+    program_path = str(
+        run_state.get("program_path")
+        or _absolute_workspace_path(run_tag, "repo/program.md")
+    )
+    results_path = str(
+        run_state.get("results_path")
+        or _absolute_workspace_path(run_tag, "repo/results.tsv")
+    )
+    run_log_path = str(
+        run_state.get("run_log_path")
+        or _absolute_workspace_path(run_tag, "repo/run.log")
+    )
+    prepare_log_path = str(
+        run_state.get("prepare_log_path")
+        or _absolute_workspace_path(run_tag, "prepare.log")
+    )
+    agent_log_path = str(
+        run_state.get("agent_log_path")
+        or _absolute_workspace_path(run_tag, "agent.log")
+    )
+    payload: dict[str, Any] = {
+        "run_tag": run_tag,
+        "branch": repo_snapshot.get("branch") or run_state.get("branch"),
+        "repo_dir": run_state.get("repo_dir") or _absolute_workspace_path(run_tag, "repo"),
+        "repo_root_files": repo_snapshot.get("repo_root_files", []),
+        "workspace_seed_source": AUTORESEARCH_WORKSPACE_SEED_SOURCE,
+        "program_path": program_path,
+        "results_path": results_path,
+        "run_log_path": run_log_path,
+        "prepare_log_path": prepare_log_path,
+        "agent_log_path": agent_log_path,
+        "state_path": _absolute_workspace_path(run_tag, "modal-run-state.json"),
+        "current_commit": repo_snapshot.get("current_commit") or run_state.get("current_commit"),
+        "data_ready": run_state.get("data_ready"),
+        "tracked_changes": repo_snapshot.get("tracked_changes", []),
+        "untracked_files": repo_snapshot.get("untracked_files", []),
+        "unexpected_dirty_paths": repo_snapshot.get("unexpected_dirty_paths", []),
+        "program_preview": _read_volume_file_lines(
+            _modal_volume_remote_path(run_tag, "repo/program.md"),
+            lines=lines,
+        ),
+        "results_tail": _read_volume_file_lines(
+            _modal_volume_remote_path(run_tag, "repo/results.tsv"),
+            lines=lines,
+        ),
+        "run_log_tail": _read_volume_file_lines(
+            _modal_volume_remote_path(run_tag, "repo/run.log"),
+            lines=lines,
+        ),
+        "prepare_log_tail": _read_volume_file_lines(
+            _modal_volume_remote_path(run_tag, "prepare.log"),
+            lines=lines,
+        ),
+        "agent_log_tail": _read_volume_file_lines(
+            _modal_volume_remote_path(run_tag, "agent.log"),
+            lines=lines,
+        ),
+        "run_state": run_state,
+    }
+    return payload
+
+
+def _host_follow_up_tail_payload(run_tag: str, *, artifact: str, lines: int) -> dict[str, Any] | None:
+    run_state = _host_terminal_run_state(run_tag)
+    if run_state is None or run_state.get("status") == "running":
+        return None
+    artifact_paths = {
+        "agent": _host_artifact_paths(
+            run_state.get("agent_log_path"),
+            run_tag=run_tag,
+            suffix="agent.log",
+        ),
+        "prepare": _host_artifact_paths(
+            run_state.get("prepare_log_path"),
+            run_tag=run_tag,
+            suffix="prepare.log",
+        ),
+        "results": _host_artifact_paths(
+            run_state.get("results_path"),
+            run_tag=run_tag,
+            suffix="repo/results.tsv",
+        ),
+        "run": _host_artifact_paths(
+            run_state.get("run_log_path"),
+            run_tag=run_tag,
+            suffix="repo/run.log",
+        ),
+        "program": _host_artifact_paths(
+            run_state.get("program_path"),
+            run_tag=run_tag,
+            suffix="repo/program.md",
+        ),
+        "state": (
+            _absolute_workspace_path(run_tag, "modal-run-state.json"),
+            _modal_volume_remote_path(run_tag, "modal-run-state.json"),
+        ),
+    }
+    try:
+        display_path, remote_path = artifact_paths[artifact]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported artifact: {artifact}") from exc
+    if artifact == "state":
+        rendered_lines = json.dumps(run_state, indent=2, sort_keys=True).splitlines()
+    else:
+        rendered_lines = _read_volume_file_lines(remote_path, lines=lines)
+    return {
+        "run_tag": run_tag,
+        "branch": run_state.get("branch"),
+        "artifact": artifact,
+        "path": display_path,
+        "lines": rendered_lines,
+        "run_state": run_state,
+    }
+
+
+def _resolve_host_follow_up_payload(command: str, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    if command == "inspect":
+        run_tag = kwargs.get("run_tag")
+        tail_lines = kwargs.get("tail_lines")
+        if not isinstance(run_tag, str) or not run_tag or not isinstance(tail_lines, int):
+            return None
+        return _host_follow_up_inspect_payload(run_tag, lines=tail_lines)
+    if command == "tail":
+        run_tag = kwargs.get("run_tag")
+        artifact = kwargs.get("artifact")
+        lines = kwargs.get("lines")
+        if not isinstance(run_tag, str) or not run_tag:
+            return None
+        if not isinstance(artifact, str) or not artifact:
+            return None
+        if not isinstance(lines, int):
+            return None
+        return _host_follow_up_tail_payload(run_tag, artifact=artifact, lines=lines)
+    return None
+
+
+def _best_effort_failure_context(command: str, run_tag: Any) -> dict[str, Any] | None:
+    """Fetch compact inspect context for failed run-tagged commands when possible."""
+    if command not in FAILURE_CONTEXT_COMMANDS:
+        return None
+    if not isinstance(run_tag, str) or not run_tag:
+        return None
+    context = _host_follow_up_context(run_tag, lines=FAILURE_CONTEXT_LINES)
+    if context is not None:
+        return context
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "modal",
+            "run",
+            "-q",
+            "-m",
+            MODAL_MODULE,
+            "--mode",
+            "inspect",
+            "--run-tag",
+            run_tag,
+            "--lines",
+            str(FAILURE_CONTEXT_LINES),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = _parse_json_output(completed.stdout)
+    except CliExecutionError:
+        return None
+    payload = _maybe_reconcile_payload("inspect", payload, {"run_tag": run_tag})
+    context: dict[str, Any] = {}
+    run_state = payload.get("run_state")
+    if isinstance(run_state, dict):
+        context["run_state"] = run_state
+    for key in (
+        "agent_log_tail",
+        "run_log_tail",
+        "prepare_log_tail",
+        "results_tail",
+        "unexpected_dirty_paths",
+    ):
+        value = payload.get(key)
+        if value:
+            context[key] = value
+    return context or None
+
+
+def _lookup_modal_app_record(app_id: str) -> dict[str, Any] | None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "modal", "app", "list", "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    for item in payload:
+        if not isinstance(item, dict) or item.get("App ID") != app_id:
+            continue
+        tasks = item.get("Tasks")
+        try:
+            running_tasks = int(tasks) if tasks is not None else 0
+        except (TypeError, ValueError):
+            running_tasks = 0
+        return {
+            "app_id": app_id,
+            "state": item.get("State"),
+            "running_tasks": running_tasks,
+            "stopped_at": item.get("Stopped at"),
+        }
+    return None
+
+
+def _reconcile_run_state(
+    run_tag: str,
+    *,
+    state_status: str,
+    terminal_reason: str,
+    modal_app_state: str = "",
+    modal_app_running_tasks: int = 0,
+) -> dict[str, Any] | None:
+    argv = [
+        sys.executable,
+        "-m",
+        "modal",
+        "run",
+        "-q",
+        "-m",
+        MODAL_MODULE,
+        "--mode",
+        "reconcile-state",
+        "--run-tag",
+        run_tag,
+        "--state-status",
+        state_status,
+        "--terminal-reason",
+        terminal_reason,
+        "--modal-app-running-tasks",
+        str(modal_app_running_tasks),
+    ]
+    if modal_app_state:
+        argv.extend(["--modal-app-state", modal_app_state])
+    completed = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = _parse_json_output(completed.stdout)
+    except CliExecutionError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _maybe_reconcile_payload(command: str, payload: dict[str, Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    if command not in RECONCILE_CONTEXT_COMMANDS:
+        return payload
+
+    run_state = payload.get("run_state")
+    if not isinstance(run_state, dict) or run_state.get("status") != "running":
+        return payload
+
+    run_tag = kwargs.get("run_tag") or payload.get("run_tag")
+    if not isinstance(run_tag, str) or not run_tag:
+        return payload
+
+    modal_app_id = run_state.get("modal_app_id")
+    if not isinstance(modal_app_id, str) or not modal_app_id:
+        return payload
+
+    modal_app = _lookup_modal_app_record(modal_app_id)
+    if modal_app is None:
+        reconciled_state = _reconcile_run_state(
+            run_tag,
+            state_status="stale",
+            terminal_reason="modal_app_not_found",
+        ) or {
+            **run_state,
+            "status": "stale",
+            "terminal_reason": "modal_app_not_found",
+        }
+    elif modal_app["running_tasks"] > 0 and not modal_app["stopped_at"]:
+        enriched_state = {
+            **run_state,
+            "modal_app_running_tasks": modal_app["running_tasks"],
+        }
+        if modal_app["state"]:
+            enriched_state["modal_app_state"] = modal_app["state"]
+        payload["run_state"] = enriched_state
+        return payload
+    else:
+        reconciled_state = _reconcile_run_state(
+            run_tag,
+            state_status="interrupted",
+            terminal_reason="modal_app_stopped",
+            modal_app_state=str(modal_app["state"] or ""),
+            modal_app_running_tasks=int(modal_app["running_tasks"]),
+        ) or {
+            **run_state,
+            "status": "interrupted",
+            "terminal_reason": "modal_app_stopped",
+            "modal_app_running_tasks": modal_app["running_tasks"],
+            "modal_app_state": modal_app["state"],
+        }
+
+    payload["run_state"] = reconciled_state
+    if payload.get("artifact") == "state":
+        payload["lines"] = json.dumps(reconciled_state, indent=2, sort_keys=True).splitlines()
+    return payload
 
 
 def _load_file(path_value: str, *, flag: str) -> FileInput:
