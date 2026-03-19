@@ -284,7 +284,7 @@ def _prepare_if_needed(paths: Any, num_shards: int) -> bool:
     if is_data_ready(paths.cache_dir):
         return False
     _run_command_to_log(
-        ["uv", "run", "prepare.py", "--num-shards", str(num_shards)],
+        ["python", "prepare.py", "--num-shards", str(num_shards)],
         cwd=paths.repo_dir,
         log_path=paths.prepare_log_path,
         timeout=_settings.autoresearch_prepare_timeout,
@@ -299,8 +299,20 @@ def _current_commit(repo_dir: Path) -> str:
     return _git(repo_dir, "rev-parse", "--short", "HEAD")
 
 
+def _current_branch(repo_dir: Path) -> str:
+    return _git(repo_dir, "branch", "--show-current")
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _current_modal_app_id() -> str | None:
+    return getattr(app, "app_id", None)
+
+
+def _current_modal_function_call_id() -> str | None:
+    return modal.current_function_call_id()
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -323,6 +335,27 @@ def _write_run_state(paths: Any, **payload: Any) -> None:
     paths.state_path.write_text(json.dumps(body, indent=2, sort_keys=True), encoding="utf-8")
     maybe_chown_for_runtime_user(paths.state_path)
     _commit_volumes()
+
+
+def _open_existing_run(run_tag: str) -> tuple[Any, str]:
+    paths = build_paths(
+        _settings.autoresearch_workspace_root,
+        _settings.autoresearch_cache_root,
+        run_tag,
+    )
+    if not paths.repo_dir.exists():
+        raise RuntimeError(
+            f"Run tag {run_tag!r} does not exist. Run `prepare`, `baseline`, or `run` first."
+        )
+    if not (paths.repo_dir / ".git").exists():
+        raise RuntimeError(
+            f"Run tag {run_tag!r} is missing git metadata. Re-run `prepare` for that tag."
+        )
+    if not paths.program_path.exists():
+        raise RuntimeError(
+            f"Run tag {run_tag!r} is missing program.md. Re-run `prepare` for that tag."
+        )
+    return paths, _current_branch(paths.repo_dir) or branch_name(run_tag)
 
 
 def _git_status(repo_dir: Path) -> tuple[list[dict[str, str]], list[str]]:
@@ -391,7 +424,7 @@ def _inspect_run(paths: Any, target_branch: str, *, tail_lines: int = 20) -> dic
 
 def _train_baseline(paths: Any, description: str) -> dict[str, Any]:
     _run_command_to_log(
-        ["uv", "run", "train.py"],
+        ["python", "train.py"],
         cwd=paths.repo_dir,
         log_path=paths.run_log_path,
         timeout=_settings.autoresearch_train_timeout,
@@ -428,6 +461,76 @@ def _train_baseline(paths: Any, description: str) -> dict[str, Any]:
             "depth": summary.depth,
         },
     }
+
+
+def _recent_artifact_tails(paths: Any, *, lines: int = 20) -> dict[str, list[str]]:
+    return {
+        "agent_log_tail": _recent_lines(paths.agent_log_path, lines=lines),
+        "run_log_tail": _recent_lines(paths.run_log_path, lines=lines),
+        "prepare_log_tail": _recent_lines(paths.prepare_log_path, lines=lines),
+        "results_tail": _recent_lines(paths.results_path, lines=lines),
+    }
+
+
+def _format_failure_message(prefix: str, exc: BaseException, paths: Any) -> str:
+    detail = str(exc).strip()
+    error_line = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+    sections = [f"{prefix}: {error_line}"]
+    for name, lines in _recent_artifact_tails(paths).items():
+        if not lines:
+            continue
+        sections.append(f"{name}:\n" + "\n".join(lines))
+    return "\n\n".join(sections)
+
+
+def _record_failed_run_state(
+    paths: Any,
+    *,
+    mode: str,
+    run_tag: str,
+    branch: str,
+    exc: BaseException,
+    prefix: str,
+    **extra: Any,
+) -> RuntimeError:
+    failure_message = _format_failure_message(prefix, exc, paths)
+    _write_run_state(
+        paths,
+        mode=mode,
+        status="failed",
+        run_tag=run_tag,
+        branch=branch,
+        current_commit=_current_commit(paths.repo_dir),
+        error=failure_message,
+        error_type=type(exc).__name__,
+        **_recent_artifact_tails(paths),
+        **extra,
+    )
+    return RuntimeError(failure_message)
+
+
+def _preflight_workspace_runtime(paths: Any) -> None:
+    result = _run_command(
+        [
+            "python",
+            "-c",
+            (
+                "import kernels, pyarrow.parquet, requests, rustbpe, tiktoken, torch; "
+                "print('autoresearch-runtime-ok')"
+            ),
+        ],
+        cwd=paths.repo_dir,
+        timeout=120,
+        as_runtime_user=True,
+        env=_autoresearch_env(paths.cache_dir),
+        check=False,
+    )
+    if result.returncode == 0:
+        return
+    detail = (result.stderr or result.stdout or "").strip()
+    if detail:
+        raise RuntimeError(f"Workspace runtime preflight failed before Claude execution.\n{detail}")
+    raise RuntimeError("Workspace runtime preflight failed before Claude execution.")
 
 
 def _run_claude(prompt: str, *, cwd: Path, max_turns: int, timeout: int) -> str:
@@ -542,6 +645,9 @@ def prepare_autoresearch_run(
         run_tag=run_tag,
         branch=target_branch,
         current_commit=_current_commit(paths.repo_dir),
+        modal_app_id=_current_modal_app_id(),
+        modal_app_name=AUTORESEARCH_APP_NAME,
+        modal_function_call_id=_current_modal_function_call_id(),
     )
     try:
         prepared = _prepare_if_needed(
@@ -557,6 +663,9 @@ def prepare_autoresearch_run(
             branch=target_branch,
             current_commit=_current_commit(paths.repo_dir),
             error=str(exc),
+            modal_app_id=_current_modal_app_id(),
+            modal_app_name=AUTORESEARCH_APP_NAME,
+            modal_function_call_id=_current_modal_function_call_id(),
         )
         raise
     _write_run_state(
@@ -568,6 +677,9 @@ def prepare_autoresearch_run(
         prepared=prepared,
         data_ready=is_data_ready(paths.cache_dir),
         current_commit=_current_commit(paths.repo_dir),
+        modal_app_id=_current_modal_app_id(),
+        modal_app_name=AUTORESEARCH_APP_NAME,
+        modal_function_call_id=_current_modal_function_call_id(),
     )
     return {
         "run_tag": run_tag,
@@ -592,7 +704,7 @@ def prepare_autoresearch_run(
 )
 def get_autoresearch_program(run_tag: str) -> dict[str, Any]:
     """Return the current upstream program.md for a run tag."""
-    paths, target_branch = _bootstrap_workspace(run_tag)
+    paths, target_branch = _open_existing_run(run_tag)
     content = paths.program_path.read_text(encoding="utf-8")
     return {
         "run_tag": run_tag,
@@ -628,6 +740,9 @@ def set_autoresearch_program(run_tag: str, program_text: str) -> dict[str, Any]:
         branch=target_branch,
         program_updated=updated,
         current_commit=_current_commit(paths.repo_dir),
+        modal_app_id=_current_modal_app_id(),
+        modal_app_name=AUTORESEARCH_APP_NAME,
+        modal_function_call_id=_current_modal_function_call_id(),
     )
     return {
         "run_tag": run_tag,
@@ -647,9 +762,42 @@ def set_autoresearch_program(run_tag: str, program_text: str) -> dict[str, Any]:
     volumes=AUTORESEARCH_VOLUMES,
     timeout=600,
 )
+def reconcile_autoresearch_run_state(
+    run_tag: str,
+    state_status: str,
+    terminal_reason: str,
+    modal_app_state: str = "",
+    modal_app_running_tasks: int = 0,
+) -> dict[str, Any]:
+    """Persist a host-verified terminal state for an interrupted Modal app."""
+    paths, _target_branch = _open_existing_run(run_tag)
+    state = _read_json_if_exists(paths.state_path)
+    if state is None:
+        raise RuntimeError(f"Run tag {run_tag!r} has no modal-run-state.json to reconcile.")
+    if state.get("status") != "running":
+        return state
+
+    reconciled_state = {
+        **state,
+        "status": state_status,
+        "terminal_reason": terminal_reason,
+        "reconciled_at": _utc_now(),
+        "modal_app_running_tasks": modal_app_running_tasks,
+    }
+    if modal_app_state:
+        reconciled_state["modal_app_state"] = modal_app_state
+    _write_run_state(paths, **reconciled_state)
+    return _read_json_if_exists(paths.state_path) or reconciled_state
+
+
+@app.function(
+    image=autoresearch_image,
+    volumes=AUTORESEARCH_VOLUMES,
+    timeout=600,
+)
 def inspect_autoresearch_run(run_tag: str, tail_lines: int = 20) -> dict[str, Any]:
     """Inspect the current git/log/results state for a prepared run."""
-    paths, target_branch = _bootstrap_workspace(run_tag)
+    paths, target_branch = _open_existing_run(run_tag)
     return _inspect_run(paths, target_branch, tail_lines=tail_lines)
 
 
@@ -662,7 +810,7 @@ def tail_autoresearch_artifact(
     run_tag: str, artifact: str = "agent", lines: int = 80
 ) -> dict[str, Any]:
     """Return the tail of a common runtime artifact for a run."""
-    paths, target_branch = _bootstrap_workspace(run_tag)
+    paths, target_branch = _open_existing_run(run_tag)
     artifact_map = {
         "agent": paths.agent_log_path,
         "prepare": paths.prepare_log_path,
@@ -708,6 +856,9 @@ def run_autoresearch_baseline(
         run_tag=run_tag,
         branch=target_branch,
         current_commit=_current_commit(paths.repo_dir),
+        modal_app_id=_current_modal_app_id(),
+        modal_app_name=AUTORESEARCH_APP_NAME,
+        modal_function_call_id=_current_modal_function_call_id(),
     )
     try:
         result = _train_baseline(paths, description="baseline")
@@ -720,6 +871,9 @@ def run_autoresearch_baseline(
             branch=target_branch,
             current_commit=_current_commit(paths.repo_dir),
             error=str(exc),
+            modal_app_id=_current_modal_app_id(),
+            modal_app_name=AUTORESEARCH_APP_NAME,
+            modal_function_call_id=_current_modal_function_call_id(),
         )
         raise
     _write_run_state(
@@ -730,6 +884,9 @@ def run_autoresearch_baseline(
         branch=target_branch,
         current_commit=result["commit"],
         summary=result["summary"],
+        modal_app_id=_current_modal_app_id(),
+        modal_app_name=AUTORESEARCH_APP_NAME,
+        modal_function_call_id=_current_modal_function_call_id(),
     )
     result.update(
         {
@@ -777,8 +934,12 @@ def run_autoresearch_agent_loop(
         max_turns=max_turns,
         max_experiments=max_experiments,
         current_commit=_current_commit(paths.repo_dir),
+        modal_app_id=_current_modal_app_id(),
+        modal_app_name=AUTORESEARCH_APP_NAME,
+        modal_function_call_id=_current_modal_function_call_id(),
     )
     try:
+        _preflight_workspace_runtime(paths)
         _run_claude_to_log(
             agent_prompt,
             cwd=paths.repo_dir,
@@ -787,18 +948,19 @@ def run_autoresearch_agent_loop(
             log_path=paths.agent_log_path,
         )
     except Exception as exc:
-        _write_run_state(
+        raise _record_failed_run_state(
             paths,
             mode="agent-loop",
-            status="failed",
             run_tag=run_tag,
             branch=target_branch,
+            exc=exc,
+            prefix="Claude agent loop failed",
             max_turns=max_turns,
             max_experiments=max_experiments,
-            current_commit=_current_commit(paths.repo_dir),
-            error=str(exc),
-        )
-        raise
+            modal_app_id=_current_modal_app_id(),
+            modal_app_name=AUTORESEARCH_APP_NAME,
+            modal_function_call_id=_current_modal_function_call_id(),
+        ) from exc
 
     summary = _summary_from_run_log(paths)
     _write_run_state(
@@ -811,6 +973,9 @@ def run_autoresearch_agent_loop(
         max_experiments=max_experiments,
         current_commit=_current_commit(paths.repo_dir),
         summary=summary,
+        modal_app_id=_current_modal_app_id(),
+        modal_app_name=AUTORESEARCH_APP_NAME,
+        modal_function_call_id=_current_modal_function_call_id(),
     )
     payload = _inspect_run(paths, target_branch, tail_lines=30)
     payload["max_turns"] = max_turns
@@ -853,8 +1018,12 @@ def run_autoresearch_with_claude(
         branch=target_branch,
         max_turns=max_turns,
         current_commit=_current_commit(paths.repo_dir),
+        modal_app_id=_current_modal_app_id(),
+        modal_app_name=AUTORESEARCH_APP_NAME,
+        modal_function_call_id=_current_modal_function_call_id(),
     )
     try:
+        _preflight_workspace_runtime(paths)
         cli_output = _run_claude(
             cli_prompt,
             cwd=paths.repo_dir,
@@ -862,17 +1031,18 @@ def run_autoresearch_with_claude(
             timeout=_settings.autoresearch_claude_timeout,
         )
     except Exception as exc:
-        _write_run_state(
+        raise _record_failed_run_state(
             paths,
             mode="claude-baseline",
-            status="failed",
             run_tag=run_tag,
             branch=target_branch,
+            exc=exc,
+            prefix="Claude baseline failed",
             max_turns=max_turns,
-            current_commit=_current_commit(paths.repo_dir),
-            error=str(exc),
-        )
-        raise
+            modal_app_id=_current_modal_app_id(),
+            modal_app_name=AUTORESEARCH_APP_NAME,
+            modal_function_call_id=_current_modal_function_call_id(),
+        ) from exc
 
     payload: dict[str, Any] = {
         "run_tag": run_tag,
@@ -895,6 +1065,9 @@ def run_autoresearch_with_claude(
         max_turns=max_turns,
         current_commit=_current_commit(paths.repo_dir),
         summary=summary,
+        modal_app_id=_current_modal_app_id(),
+        modal_app_name=AUTORESEARCH_APP_NAME,
+        modal_function_call_id=_current_modal_function_call_id(),
     )
     _commit_volumes()
     return payload
@@ -911,6 +1084,10 @@ def main(
     lines: int = 80,
     program_file: str = "",
     prompt_file: str = "",
+    state_status: str = "",
+    terminal_reason: str = "",
+    modal_app_state: str = "",
+    modal_app_running_tasks: int = 0,
 ) -> None:
     """Convenience local entrypoint for common autoresearch flows."""
     requested_run_tag = run_tag or None
@@ -940,6 +1117,20 @@ def main(
         if requested_run_tag is None:
             raise ValueError("--run-tag is required for mode=tail")
         result = tail_autoresearch_artifact.remote(run_tag=run_tag, artifact=artifact, lines=lines)
+    elif mode == "reconcile-state":
+        if requested_run_tag is None:
+            raise ValueError("--run-tag is required for mode=reconcile-state")
+        if not state_status:
+            raise ValueError("--state-status is required for mode=reconcile-state")
+        if not terminal_reason:
+            raise ValueError("--terminal-reason is required for mode=reconcile-state")
+        result = reconcile_autoresearch_run_state.remote(
+            run_tag=run_tag,
+            state_status=state_status,
+            terminal_reason=terminal_reason,
+            modal_app_state=modal_app_state,
+            modal_app_running_tasks=modal_app_running_tasks,
+        )
     elif mode == "baseline":
         result = run_autoresearch_baseline.remote(run_tag=requested_run_tag)
     elif mode == "agent-loop":

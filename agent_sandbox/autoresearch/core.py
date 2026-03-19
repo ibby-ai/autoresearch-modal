@@ -214,11 +214,12 @@ def build_claude_baseline_prompt(run_tag: str, prepare_num_shards: int) -> str:
 
         1. Verify the current branch is `{branch}`. If it does not exist yet, create it from the current `master`.
         2. Read `README.md`, `program.md`, `prepare.py`, and `train.py` before taking action.
-        3. If `.venv` is missing, run `uv sync`.
-        4. If `~/.cache/autoresearch` is not ready, run `uv run prepare.py --num-shards {prepare_num_shards}`.
+        3. This Modal image already has the Python dependencies installed. Do not run `uv sync`
+           and do not create a workspace-local `.venv`.
+        4. If `~/.cache/autoresearch` is not ready, run `python prepare.py --num-shards {prepare_num_shards}`.
         5. Ensure `results.tsv` exists with the exact upstream header row.
         6. Do exactly one baseline training run with the code as-is:
-           `uv run train.py > run.log 2>&1`
+           `python train.py > run.log 2>&1`
         7. Inspect the summary with:
            `grep "^val_bpb:\\|^peak_vram_mb:" run.log`
         8. Record the baseline in `results.tsv` as a `keep` row with description `baseline`.
@@ -248,11 +249,12 @@ def build_autoresearch_agent_prompt(
 
         1. Verify the current branch is `{branch}`. If it does not exist yet, create it from the current `master`.
         2. Read `README.md`, `program.md`, `prepare.py`, and `train.py` before acting.
-        3. If `.venv` is missing, run `uv sync`.
-        4. If `~/.cache/autoresearch` is not ready, run `uv run prepare.py --num-shards {prepare_num_shards}`.
+        3. This Modal image already has the Python dependencies installed. Do not run `uv sync`
+           and do not create a workspace-local `.venv`.
+        4. If `~/.cache/autoresearch` is not ready, run `python prepare.py --num-shards {prepare_num_shards}`.
         5. Ensure `results.tsv` exists with the exact upstream header row.
         6. If `results.tsv` only has the header row or no baseline entry yet, establish the baseline first:
-           `uv run train.py > run.log 2>&1`
+           `python train.py > run.log 2>&1`
            then inspect `run.log`, record the row as `keep` with description `baseline`, and continue.
 
         Autonomous experiment loop:
@@ -265,7 +267,7 @@ def build_autoresearch_agent_prompt(
           1. Inspect git state and note the starting commit.
           2. Edit `train.py` with one concrete idea.
           3. Commit the `train.py` change.
-          4. Run `uv run train.py > run.log 2>&1`.
+          4. Run `python train.py > run.log 2>&1`.
           5. Read `grep "^val_bpb:\\|^peak_vram_mb:" run.log`.
           6. If the run crashed, inspect `tail -n 50 run.log`, decide whether to retry a small obvious fix or log a `crash` row and move on.
           7. Append the outcome to `results.tsv` using the upstream tab-separated format.
