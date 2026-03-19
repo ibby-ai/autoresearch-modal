@@ -9,22 +9,22 @@ source .venv/bin/activate
 uv run ruff check --fix .
 uv run ruff format .
 uv run pytest
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app::probe_autoresearch_environment
+uv run autoresearch-modal probe
 ```
 
 Run these when the Modal runtime, settings, prompt, or orchestration path changes:
 
 ```bash
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app::prepare_autoresearch_run --run-tag <tag> --num-shards 10
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app::run_autoresearch_baseline --run-tag <tag>
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode get-program --run-tag <tag>
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode inspect --run-tag <tag> --lines 20
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode agent-loop --run-tag <tag> --max-experiments 1 --max-turns 40
+uv run autoresearch-modal prepare --run-tag <tag> --num-shards 10
+uv run autoresearch-modal baseline --run-tag <tag>
+uv run autoresearch-modal program get --run-tag <tag>
+uv run autoresearch-modal inspect --run-tag <tag> --lines 20
+uv run autoresearch-modal run --run-tag <tag> --max-experiments 1 --max-turns 40
 ```
 
 ## Expectations
 
-- Keep Python 3.11 for local Modal CLI calls.
+- Keep Python 3.11 for local CLI calls.
 - Treat the direct baseline as the fastest end-to-end smoke.
 - Treat the agent loop as the primary workflow proof when secrets are present.
 - Treat the legacy one-shot Claude baseline as a support/debug surface, not the product-defining path.

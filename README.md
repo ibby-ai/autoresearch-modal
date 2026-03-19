@@ -71,20 +71,25 @@ uv run --python 3.11 modal setup
 uv run --python 3.11 modal secret create anthropic-secret ANTHROPIC_API_KEY=your_key_here
 ```
 
-Primary Modal commands:
+Developer CLI:
 
 ```bash
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app::probe_autoresearch_environment
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app::prepare_autoresearch_run --num-shards 10
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode get-program --run-tag <returned-run-tag>
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode set-program --run-tag <returned-run-tag> --program-file ./program.md
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode agent-loop --run-tag <returned-run-tag> --max-experiments 12 --max-turns 200
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode inspect --run-tag <returned-run-tag> --lines 30
+uv run autoresearch-modal probe
+uv run autoresearch-modal prepare --num-shards 10
+uv run autoresearch-modal program get --run-tag <returned-run-tag>
+uv run autoresearch-modal program set --run-tag <returned-run-tag> --file ./program.md
+uv run autoresearch-modal baseline --run-tag <returned-run-tag>
+uv run autoresearch-modal run --run-tag <returned-run-tag> --max-experiments 12 --max-turns 200
+uv run autoresearch-modal inspect --run-tag <returned-run-tag> --lines 30
+uv run autoresearch-modal tail --run-tag <returned-run-tag> --artifact agent --lines 80
+uv run autoresearch-modal claude-baseline --run-tag <returned-run-tag>
 ```
 
-The legacy one-shot Claude baseline still exists at `agent_sandbox.autoresearch_app::run_autoresearch_with_claude`, but the primary workflow is now the upstream-style agent loop.
+`autoresearch-modal` is the canonical developer-facing interface. It dispatches to the repo's Modal local entrypoint internally, so developers do not need to call `modal run -m ...` directly.
 
-For first-time `prepare`, `baseline`, and `agent-loop` runs, `--run-tag` is optional. When you omit it, the runtime generates a sortable tag such as `20260317-154233-baseline-a7c3f1`, returns it in the payload, and the local entrypoint prints it in the JSON result. Save that `run_tag` for later `inspect`, `tail`, `get-program`, `set-program`, or resume flows, because those still require an explicit tag.
+Append `--dry-run` before or after a subcommand to preview the resolved Modal target, argv, scalar kwargs, and compact file metadata without calling Modal. Example: `uv run autoresearch-modal --dry-run prepare --num-shards 10`.
+
+For first-time `prepare`, `baseline`, and `run` invocations, `--run-tag` is optional. When you omit it, the CLI generates a sortable tag such as `20260317-154233-baseline-a7c3f1`, returns it in the payload, and prints it in the JSON result. Save that `run_tag` for later `inspect`, `tail`, `program get`, `program set`, `claude-baseline`, or resume flows, because those still require an explicit tag.
 
 ## Running the agent
 

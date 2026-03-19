@@ -9,7 +9,7 @@
 3. warm and reuse the upstream cache
 4. run one direct GPU baseline smoke
 5. run a Claude-driven agent loop that follows the upstream research contract
-6. inspect the resulting logs, results, and git state through repo-local entrypoints
+6. inspect the resulting logs, results, and git state through the repo-owned `autoresearch-modal` CLI
 
 This repo now carries the upstream research files at the root and adds orchestration, guardrails, validation, and repository-local knowledge around them.
 
@@ -17,6 +17,7 @@ This repo now carries the upstream research files at the root and adds orchestra
 
 | Path | Responsibility |
 | --- | --- |
+| `cli/` | Developer-facing terminal surface with stable subcommands, live execution, and dry-run previews over the Modal runtime |
 | `agent_sandbox/autoresearch_app.py` | Modal app, image, volumes, public entrypoints, and subprocess orchestration |
 | `agent_sandbox/autoresearch/core.py` | Shared helpers for path layout, vendored-root seeding, results rows, prompt construction, and training-log parsing |
 | `agent_sandbox/config/settings.py` | Typed runtime configuration and Modal secret wiring |
@@ -48,7 +49,7 @@ This repo now carries the upstream research files at the root and adds orchestra
 7. Surface `program.md` so the human can steer the agent loop for that run tag.
 8. Warm the upstream cache with `uv run prepare.py` when needed.
 9. Run `uv run train.py` directly for a deterministic smoke or via a Claude prompt that follows the upstream loop contract.
-10. Persist inspection artifacts (`results.tsv`, logs, git state summary) so operators can resume or audit a run from repo-local commands.
+10. Persist inspection artifacts (`results.tsv`, logs, git state summary) so operators can resume or audit a run from the dedicated CLI.
 
 ## Knowledge System
 

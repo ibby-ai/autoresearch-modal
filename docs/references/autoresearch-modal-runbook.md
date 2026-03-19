@@ -4,6 +4,10 @@
 
 Read this after `AGENTS.md`, `ARCHITECTURE.md`, and the product spec when you need exact operator commands.
 
+`autoresearch-modal` is the canonical developer-facing CLI. The commands below describe that CLI and the Modal runtime behavior it wraps through the repo's Modal local entrypoint.
+
+Any CLI command can be previewed with `--dry-run`. That prints the resolved Modal target, subprocess argv, scalar kwargs, and compact file metadata for file-backed inputs such as `program set --file ...`, and it skips the live Modal call.
+
 The repo root already carries the upstream top-level file set in merged form:
 
 - `.gitignore`
@@ -84,18 +88,19 @@ The run root also carries wrapper-owned inspection artifacts:
 
 ```bash
 source .venv/bin/activate
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app::probe_autoresearch_environment
+uv run autoresearch-modal probe
 ```
 
 This validates that the Modal image has `python`, `git`, and `claude` available.
 
 ### 2. Prepare a run workspace and cache
 
-For a first-time run you may omit `--run-tag`, and the runtime will generate one for you. The upstream repo still expects the branch `autoresearch/<run_tag>` from `master`, so save the returned tag for later commands.
+For a first-time run you may omit `--run-tag`, and the CLI will generate one for you. The upstream repo still expects the branch `autoresearch/<run_tag>` from `master`, so save the returned tag for later commands.
 
 ```bash
 source .venv/bin/activate
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app::prepare_autoresearch_run --num-shards 10
+uv run autoresearch-modal prepare --num-shards 10
+uv run autoresearch-modal --dry-run prepare --num-shards 10
 ```
 
 This:
@@ -106,7 +111,7 @@ This:
 - creates `results.tsv` if needed
 - runs `uv run prepare.py --num-shards 10` when `~/.cache/autoresearch` is not ready
 - keeps Triton, TorchInductor, and uv caches under the mounted cache volume
-- returns the actual `run_tag` in the payload; later `inspect`, `tail`, `get-program`, `set-program`, or resume flows must use that exact tag
+- returns the actual `run_tag` in the payload; later `inspect`, `tail`, `program get`, `program set`, `claude-baseline`, or resume flows must use that exact tag
 
 ### 3. Read or update `program.md`
 
@@ -114,14 +119,14 @@ Inspect the current program:
 
 ```bash
 source .venv/bin/activate
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode get-program --run-tag <returned-run-tag>
+uv run autoresearch-modal program get --run-tag <returned-run-tag>
 ```
 
 Update it from a local file:
 
 ```bash
 source .venv/bin/activate
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode set-program --run-tag <returned-run-tag> --program-file ./program.md
+uv run autoresearch-modal program set --run-tag <returned-run-tag> --file ./program.md
 ```
 
 This keeps the upstream `program.md` as the human-controlled control plane for that run tag.
@@ -130,16 +135,16 @@ This keeps the upstream `program.md` as the human-controlled control plane for t
 
 ```bash
 source .venv/bin/activate
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app::run_autoresearch_baseline
+uv run autoresearch-modal baseline
 ```
 
 This uses a GPU-backed Modal function, runs upstream `train.py` once, parses the summary block, appends a `baseline` row to `results.tsv`, and returns the actual `run_tag` used for the run.
 
-### 5. Run the primary agent loop
+### 5. Run the primary experiment loop
 
 ```bash
 source .venv/bin/activate
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode agent-loop --max-experiments 12 --max-turns 200
+uv run autoresearch-modal run --max-experiments 12 --max-turns 200
 ```
 
 This path:
@@ -157,7 +162,7 @@ Inspect the current state:
 
 ```bash
 source .venv/bin/activate
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode inspect --run-tag <returned-run-tag> --lines 30
+uv run autoresearch-modal inspect --run-tag <returned-run-tag> --lines 30
 ```
 
 The inspect payload reports `workspace_seed_source: "vendored-project-root-allowlist"` and `repo_root_files`; use those fields to confirm no wrapper-owned top-level entries leaked into a fresh run repo.
@@ -166,7 +171,7 @@ Tail a specific artifact:
 
 ```bash
 source .venv/bin/activate
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode tail --run-tag <returned-run-tag> --artifact agent --lines 80
+uv run autoresearch-modal tail --run-tag <returned-run-tag> --artifact agent --lines 80
 ```
 
 Supported `artifact` values are `agent`, `prepare`, `results`, `run`, `program`, and `state`.
@@ -177,35 +182,19 @@ The previous bounded Claude baseline still exists if you need one focused smoke/
 
 ```bash
 source .venv/bin/activate
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app::run_autoresearch_with_claude --run-tag mar16claude
-```
-
-## Convenience Local Entrypoint
-
-You can also use the app’s local entrypoint:
-
-```bash
-source .venv/bin/activate
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode probe
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode prepare
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode get-program --run-tag <returned-run-tag>
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode set-program --run-tag <returned-run-tag> --program-file ./program.md
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode baseline
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode agent-loop --max-experiments 12 --max-turns 200
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode inspect --run-tag <returned-run-tag> --lines 30
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode tail --run-tag <returned-run-tag> --artifact agent --lines 80
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode claude-baseline --run-tag <returned-run-tag>
+uv run autoresearch-modal claude-baseline --run-tag mar16claude
 ```
 
 ## Notes And Constraints
 
 - Upstream `autoresearch` currently uses `master`, not `main`.
 - The direct baseline path does not require `ANTHROPIC_API_KEY`; the Claude-driven paths do.
-- `prepare`, `baseline`, and `agent-loop` can generate a fresh `run_tag` automatically, but `inspect`, `tail`, `get-program`, `set-program`, and `claude-baseline` still require an explicit one.
+- `prepare`, `baseline`, and `run` can generate a fresh `run_tag` automatically, but `inspect`, `tail`, `program get`, `program set`, and `claude-baseline` still require an explicit one.
+- `--dry-run` previews the exact CLI-resolved target and kwargs and does not contact Modal.
 - The default GPU is `H100`, configurable through `AUTORESEARCH_GPU`.
 - `prepare.py` writes to `~/.cache/autoresearch`, so the cache volume must stay mounted at that exact path for compatibility with upstream code.
 - `TRITON_CACHE_DIR` and `TORCHINDUCTOR_CACHE_DIR` are redirected into the mounted cache volume. That fixes the non-root permission issue that originally blocked baseline runs.
 - `UV_CACHE_DIR` is also routed into the mounted cache volume so upstream `uv` commands stay warm across sessions.
-- In this workspace, Modal CLI calls were reliable under Python 3.11. A Python 3.14-created `.venv` triggered a local `grpclib` assertion before requests reached Modal.
+- In this workspace, `autoresearch-modal` calls were reliable under Python 3.11. A Python 3.14-created `.venv` triggered a local `grpclib` assertion before requests reached Modal.
 - The repo is versioned locally, but the experiment git state that matters lives inside the per-run workspace repo on the workspace volume.
 - The wrapper intentionally keeps the human/agent split from upstream: the human edits `program.md`; the agent loop edits `train.py`.

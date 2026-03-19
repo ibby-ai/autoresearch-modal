@@ -38,7 +38,7 @@
 
 ## Working Rules
 
-- Keep the scope narrow: vendored upstream root files, persistent Modal workspaces seeded from this repo, human-controlled `program.md`, direct baseline smoke runs, Claude-driven agent loops, and inspect/tail surfaces.
+- Keep the scope narrow: vendored upstream root files, persistent Modal workspaces seeded from this repo, the `autoresearch-modal` CLI, human-controlled `program.md`, direct baseline smoke runs, Claude-driven agent loops, and inspect/tail surfaces.
 - Prefer durable repo-local docs over prompt-only guidance.
 - New complex work starts under `docs/exec-plans/active/<slug>/` and moves to `docs/exec-plans/completed/` when finished.
 - Keep `AGENTS.md` map-style. Put lasting detail in the docs tree, not here.
@@ -57,6 +57,6 @@ source .venv/bin/activate
 uv run ruff check --fix .
 uv run ruff format .
 uv run pytest
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app::probe_autoresearch_environment
-uv run --python 3.11 modal run -m agent_sandbox.autoresearch_app --mode inspect --run-tag smoke --lines 20
+uv run autoresearch-modal probe
+uv run autoresearch-modal inspect --run-tag smoke --lines 20
 ```
