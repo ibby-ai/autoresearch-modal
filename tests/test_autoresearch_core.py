@@ -140,7 +140,8 @@ def test_build_claude_baseline_prompt_is_bounded():
     assert "autoresearch/mar16" in prompt
     assert "Do exactly one baseline training run" in prompt
     assert "Do not modify `train.py`" in prompt
-    assert "uv run train.py > run.log 2>&1" in prompt
+    assert "Do not run `uv sync`" in prompt
+    assert "python train.py > run.log 2>&1" in prompt
 
 
 def test_build_autoresearch_agent_prompt_matches_upstream_loop():
@@ -149,6 +150,7 @@ def test_build_autoresearch_agent_prompt_matches_upstream_loop():
     assert "autoresearch/mar16" in prompt
     assert "Treat `README.md` and `program.md` as the primary contract" in prompt
     assert "Modify only `train.py`." in prompt
-    assert "uv run train.py > run.log 2>&1" in prompt
+    assert "Do not run `uv sync`" in prompt
+    assert "python train.py > run.log 2>&1" in prompt
     assert "Perform up to 12 completed experiment attempts" in prompt
     assert "Do not ask the human for confirmation once the loop begins." in prompt

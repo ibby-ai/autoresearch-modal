@@ -248,6 +248,145 @@ def test_inspect_and_tail_dry_run_payloads(capsys, argv, expected_kwargs):
     assert payload["kwargs"] == expected_kwargs
 
 
+def test_host_follow_up_inspect_payload_reconciles_stopped_run(monkeypatch):
+    run_state = {
+        "status": "running",
+        "run_tag": "mar16-run",
+        "branch": "autoresearch/mar16-run",
+        "repo_dir": "/home/agent/workspaces/autoresearch/mar16-run/repo",
+        "program_path": "/home/agent/workspaces/autoresearch/mar16-run/repo/program.md",
+        "results_path": "/home/agent/workspaces/autoresearch/mar16-run/repo/results.tsv",
+        "run_log_path": "/home/agent/workspaces/autoresearch/mar16-run/repo/run.log",
+        "prepare_log_path": "/home/agent/workspaces/autoresearch/mar16-run/prepare.log",
+        "agent_log_path": "/home/agent/workspaces/autoresearch/mar16-run/agent.log",
+        "current_commit": "0045fb8",
+        "modal_app_id": "ap-123",
+    }
+    app_record = {
+        "app_id": "ap-123",
+        "state": "stopped",
+        "running_tasks": 0,
+        "stopped_at": "2026-03-19 20:54:22+10:30",
+    }
+    reconciled_state = {
+        **run_state,
+        "status": "interrupted",
+        "terminal_reason": "modal_app_stopped",
+        "modal_app_state": "stopped",
+        "modal_app_running_tasks": 0,
+    }
+    repo_snapshot = {
+        "repo_dir": "/tmp/repo",
+        "repo_root_files": ["README.md", "program.md"],
+        "current_commit": "0045fb8",
+        "tracked_changes": [{"status": "M", "path": "train.py"}],
+        "untracked_files": ["results.tsv"],
+        "unexpected_dirty_paths": [],
+    }
+    tails = {
+        "/mar16-run/repo/program.md": ["program line"],
+        "/mar16-run/repo/results.tsv": ["results line"],
+        "/mar16-run/repo/run.log": ["run line"],
+        "/mar16-run/prepare.log": ["prepare line"],
+        "/mar16-run/agent.log": ["agent line"],
+    }
+    calls: list[tuple[str, object]] = []
+    run_state_reads = [run_state, reconciled_state]
+
+    monkeypatch.setattr(
+        cli_commands,
+        "_read_host_run_state",
+        lambda run_tag: run_state_reads.pop(0) if run_state_reads else reconciled_state,
+    )
+    monkeypatch.setattr(cli_commands, "_lookup_modal_app_record", lambda app_id: app_record)
+    monkeypatch.setattr(
+        cli_commands,
+        "_reconcile_run_state",
+        lambda *args, **kwargs: calls.append(("reconcile", (args, kwargs))) or reconciled_state,
+    )
+    monkeypatch.setattr(cli_commands, "_read_host_repo_snapshot", lambda run_tag: repo_snapshot)
+    monkeypatch.setattr(
+        cli_commands,
+        "_read_volume_file_lines",
+        lambda remote_path, *, lines: tails.get(remote_path, []),
+    )
+
+    payload = cli_commands._host_follow_up_inspect_payload("mar16-run", lines=20)
+
+    assert payload is not None
+    assert payload["run_state"]["status"] == "interrupted"
+    assert payload["run_state"]["terminal_reason"] == "modal_app_stopped"
+    assert payload["repo_root_files"] == ["README.md", "program.md"]
+    assert payload["run_log_tail"] == ["run line"]
+    assert payload["prepare_log_tail"] == ["prepare line"]
+    assert payload["agent_log_tail"] == ["agent line"]
+    assert calls and calls[0][0] == "reconcile"
+
+
+def test_host_follow_up_tail_payload_reads_volume_relative_artifact_path(monkeypatch):
+    run_state = {
+        "status": "interrupted",
+        "run_tag": "mar16-run",
+        "branch": "autoresearch/mar16-run",
+        "program_path": "/home/agent/workspaces/autoresearch/mar16-run/repo/program.md",
+    }
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli_commands, "_host_terminal_run_state", lambda run_tag: run_state)
+    monkeypatch.setattr(
+        cli_commands,
+        "_read_volume_file_lines",
+        lambda remote_path, *, lines: calls.append(remote_path) or ["program line"],
+    )
+
+    payload = cli_commands._host_follow_up_tail_payload(
+        "mar16-run",
+        artifact="program",
+        lines=20,
+    )
+
+    assert payload is not None
+    assert payload["path"] == "/home/agent/workspaces/autoresearch/mar16-run/repo/program.md"
+    assert payload["lines"] == ["program line"]
+    assert calls == ["/mar16-run/repo/program.md"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "payload"),
+    [
+        (
+            ["inspect", "--run-tag", "mar16-run", "--lines", "20"],
+            {"run_state": {"status": "interrupted"}, "run_tag": "mar16-run"},
+        ),
+        (
+            ["tail", "--run-tag", "mar16-run", "--artifact", "state", "--lines", "80"],
+            {
+                "artifact": "state",
+                "lines": [],
+                "path": "/home/agent/workspaces/autoresearch/mar16-run/modal-run-state.json",
+                "run_state": {"status": "interrupted"},
+                "run_tag": "mar16-run",
+            },
+        ),
+    ],
+)
+def test_follow_up_commands_use_host_payload_without_modal_runner(monkeypatch, capsys, argv, payload):
+    calls: list[list[str]] = []
+
+    def fake_run(argv, capture_output, text, check):
+        calls.append(list(argv))
+        raise AssertionError("live Modal runner should not be used for terminal follow-up commands")
+
+    monkeypatch.setattr(cli_commands, "_resolve_host_follow_up_payload", lambda cmd, kwargs: payload)
+    monkeypatch.setattr(cli_commands.subprocess, "run", fake_run)
+
+    exit_code = cli_main.main(argv)
+
+    assert exit_code == 0
+    assert _load_stdout_json(capsys) == payload
+    assert calls == []
+
+
 def test_claude_baseline_live_failure_is_concise(monkeypatch, capsys):
     def fake_run(argv, capture_output, text, check):
         return subprocess.CompletedProcess(
@@ -265,6 +404,58 @@ def test_claude_baseline_live_failure_is_concise(monkeypatch, capsys):
     assert exit_code == 1
     assert "`autoresearch-modal claude-baseline` failed with exit code 1." in captured.err
     assert "trace line 2" in captured.err
+
+
+def test_run_failure_includes_best_effort_inspect_context(monkeypatch, capsys):
+    calls: list[list[str]] = []
+
+    def fake_run(argv, capture_output, text, check):
+        calls.append(list(argv))
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                stdout="",
+                stderr="modal failure\ntrace line 1\ntrace line 2\n",
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true}\n', stderr="")
+
+    monkeypatch.setattr(cli_commands.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        cli_commands,
+        "_host_follow_up_context",
+        lambda run_tag, *, lines: {
+            "run_state": {"status": "interrupted", "run_tag": run_tag},
+            "run_log_tail": ["python exploded"],
+        },
+    )
+
+    exit_code = cli_main.main(["run", "--run-tag", "mar16-run"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Run context:" in captured.err
+    assert '"status": "interrupted"' in captured.err
+    assert "python exploded" in captured.err
+    assert calls == [
+        [
+            sys.executable,
+            "-m",
+            "modal",
+            "run",
+            "-q",
+            "-m",
+            "agent_sandbox.autoresearch_app",
+            "--mode",
+            "agent-loop",
+            "--max-turns",
+            "200",
+            "--max-experiments",
+            "12",
+            "--run-tag",
+            "mar16-run",
+        ]
+    ]
 
 
 def test_parser_accepts_dry_run_before_and_after_subcommand(capsys):
